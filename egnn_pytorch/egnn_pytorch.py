@@ -536,3 +536,101 @@ class GeomUpdater(nn.Module):
             correction += einsum('b i j k, b i j k c -> b i c', triple_weights, rijk) * update_mask
         
         return geom + correction
+
+    
+class AttentiveGeomUpdater(nn.Module):
+    """DOES NOT WORK"""
+    def __init__(
+        self,
+        dim,
+        hidden_dim = 64,
+        head_size = 8,
+        heads = 4,
+        norm_rel_coors = True,
+        power_mean = True,
+        dropout = 0.0,
+        init_eps = 1e-3,
+    ):
+        super().__init__()
+        dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+        
+        self.message_mlp = nn.Sequential(
+            nn.Linear(2 * dim + 1, hidden_dim),
+            dropout,
+            nn.SiLU(),
+            nn.Linear(hidden_dim, heads),
+        )
+        
+        
+        self.query = nn.Sequential(
+            nn.Linear(dim , hidden_dim, bias = False),
+            dropout,
+            nn.SiLU(),
+            nn.Linear(hidden_dim, heads*head_size, bias = False),
+        )
+        
+        self.key = nn.Sequential(
+            nn.Linear(dim , hidden_dim, bias = False),
+            dropout,
+            nn.SiLU(),
+            nn.Linear(hidden_dim, heads*head_size, bias = False),
+        )
+        
+        self.heads = heads
+        self.head_size = head_size
+        self.norm_rel_coors = norm_rel_coors
+        self.power_mean = power_mean
+        
+        self.soft = nn.Softmax( dim = 2)
+
+        if norm_rel_coors:
+            self.rel_coors_scale = nn.Parameter(torch.ones(1))
+            
+        if power_mean:
+            self.p = nn.Parameter(torch.ones(heads))
+            
+        self.init_eps = init_eps
+        self.message_mlp.apply(self.init_)
+        
+        
+    def init_(self, module):
+        if type(module) in {nn.Linear}:
+            nn.init.normal_(module.weight, std = self.init_eps)
+            
+    def forward(self, geom, features, update_mask = None):
+        b, n, d = features.shape
+        heads, head_size = self.heads, self.head_size
+        
+        if update_mask is None:
+            update_mask = torch.ones(geom.shape)
+            
+            
+        rel_coors = rearrange(geom, 'b i d -> b i () d') - rearrange(geom, 'b j d -> b () j d')
+        rel_dist = (rel_coors ** 2).sum(dim = -1, keepdim = True)    
+        
+        if self.norm_rel_coors:
+            rel_coors = F.normalize(rel_coors, dim = -1) * self.rel_coors_scale
+
+        feats_j = rearrange(features, 'b j d -> b () j d')
+        feats_i = rearrange(features, 'b i d -> b i () d')
+        feats_i, feats_j = broadcast_tensors(feats_i, feats_j)
+
+        inp = torch.cat((feats_i, feats_j, rel_dist), dim = -1)
+        pair_weights = self.message_mlp(inp)    
+        
+        qi = self.query(features).reshape(b, n, 1,  heads, head_size)
+        kj = self.key(features).reshape(b, 1, n, heads, head_size)
+
+        qi, kj = broadcast_tensors(qi, kj)
+
+        alpha_ij = self.soft(einsum("b i j h c, b i j h c -> b i j h", qi, kj)) * pair_weights
+        rel = rearrange(rel_coors, "b i j d -> b i j () d")
+        alp = rearrange(alpha_ij, "b i j h -> b i j h ()")
+        
+        rel_coors_per_head_per_coord = (rel*alp).pow(rearrange(self.p, "h -> () () () h ()"))
+        correction_per_head = rel_coors_per_head_per_coord.mean(dim = 2).pow(rearrange(1/(self.p + 1e-8), "h -> () () h ()"))
+        total_correction = correction_per_head.sum(-2)
+        
+        correction = total_correction * update_mask
+        
+        return geom + correction
