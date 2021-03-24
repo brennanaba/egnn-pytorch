@@ -448,3 +448,91 @@ class EGNN_Sparse_Network(nn.Module):
 
     def __repr__(self):
         return 'EGNN_Sparse_Network of: {0} layers'.format(len(self.mpnn_layers))
+    
+    
+class GeomUpdater(nn.Module):
+    def __init__(
+        self,
+        dim,
+        hidden_dim = 64,
+        norm_rel_coors = True,
+        dropout = 0.0,
+        init_eps = 1.,
+        triple = True
+    ):
+        super().__init__()
+        dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+        
+        self.one_interaction_mlp = nn.Sequential(
+            nn.Linear(2 * (dim) + 1 , hidden_dim),
+            dropout,
+            nn.SiLU(),
+            nn.Linear(hidden_dim, 1),
+        )
+            
+        self.triple = triple
+        self.norm_rel_coors = norm_rel_coors
+        
+        if triple:
+            self.double_interaction_mlp = nn.Sequential(
+                nn.Linear(3 * (dim + 1)  , hidden_dim),
+                dropout,
+                nn.SiLU(),
+                nn.Linear(hidden_dim, 1),
+            )
+
+        if norm_rel_coors:
+            self.rel_coors_scale = nn.Parameter(torch.ones(1))
+            
+        self.init_eps = init_eps
+        self.apply(self.init_)
+        
+        
+    def init_(self, module):
+        if type(module) in {nn.Linear}:
+            # seems to be needed to keep the network from exploding to NaN with greater depths
+            nn.init.normal_(module.weight, std = self.init_eps)
+            
+    def forward(self, geom, features, update_mask = None):
+        b, n, d = geom.shape
+        if update_mask is None:
+            update_mask = torch.ones(geom.shape)
+            
+        rel_coors = rearrange(geom, 'b i d -> b i () d') - rearrange(geom, 'b j d -> b () j d')
+        rel_dist = (rel_coors ** 2).sum(dim = -1, keepdim = True)    
+        
+        if self.norm_rel_coors:
+            rel_coors = F.normalize(rel_coors, dim = -1) * self.rel_coors_scale
+            
+        feats_j = rearrange(features, 'b j d -> b () j () d')
+        feats_i = rearrange(features, 'b i d -> b i () () d')
+        feats_k = rearrange(features, 'b k d -> b () () k d')
+        feats_i, feats_j, feats_k = broadcast_tensors(feats_i, feats_j, feats_k)
+        
+        #Pair interactions:
+        inp = torch.cat((feats_i[:,:,:,0], feats_j[:,:,:,0], rel_dist), dim = -1)
+        pair_weights = self.one_interaction_mlp(inp)
+        pair_weights = rearrange(pair_weights, 'b i j () -> b i j')
+        
+        correction = einsum('b i j, b i j c -> b i c', pair_weights, rel_coors) * update_mask
+        
+        #Triplet interactions:
+        if self.triple:
+            rij = rearrange(rel_coors, 'b i j d -> b i j () d')
+            rik = rearrange(rel_coors, 'b i k d -> b i () k d')
+            rij, rik = broadcast_tensors(rij,rik)
+            rijk = torch.cross(rij, rik, dim = -1)
+
+            distij = rearrange(rel_dist, 'b i j d -> b i j () d')
+            distik = rearrange(rel_dist, 'b i k d -> b i () k d')
+            distjk = rearrange(rel_dist, 'b j k d -> b () j k d')
+            distij, distik, distjk =  broadcast_tensors(distij, distik, distjk)
+
+            inp3 = torch.cat((feats_i, feats_j, feats_k, distij, distik, distjk), dim = -1)
+
+            triple_weights = self.double_interaction_mlp(inp3)
+            triple_weights = rearrange(triple_weights, 'b i j k () -> b i j k')
+        
+            correction += einsum('b i j k, b i j k c -> b i c', triple_weights, rijk) * update_mask
+        
+        return geom + correction
