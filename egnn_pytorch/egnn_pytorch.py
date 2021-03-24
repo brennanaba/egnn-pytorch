@@ -64,7 +64,8 @@ class EGNN(nn.Module):
         init_eps = 1e-3,
         norm_feats = False,
         update_feats = True,
-        update_coors = True
+        update_coors = True,
+        power_mean = True
     ):
         super().__init__()
         assert update_feats or update_coors, 'you must update either features, coordinates, or both'
@@ -96,6 +97,11 @@ class EGNN(nn.Module):
 
         if norm_rel_coors:
             self.rel_coors_scale = nn.Parameter(torch.ones(1))
+            
+        if power_mean:
+            self.p = nn.Parameter(torch.ones(1))
+        else:
+            self.p = 1.0
 
         self.coors_mlp = nn.Sequential(
             nn.Linear(m_dim, m_dim * 4),
@@ -107,7 +113,7 @@ class EGNN(nn.Module):
         self.num_nearest_neighbors = num_nearest_neighbors
 
         self.init_eps = init_eps
-        self.apply(self.init_)
+        self.coors_mlp.apply(self.init_)
 
     def init_(self, module):
         if type(module) in {nn.Linear}:
@@ -178,7 +184,7 @@ class EGNN(nn.Module):
             coors_out = coors
 
         if exists(self.node_mlp):
-            m_i = m_ij.sum(dim = -2)
+            m_i = m_ij.pow(self.p).sum(dim = -2).pow(1/self.p)
 
             normed_feats = self.node_norm(feats)
             node_mlp_input = torch.cat((normed_feats, m_i), dim = -1)
