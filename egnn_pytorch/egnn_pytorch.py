@@ -184,7 +184,7 @@ class EGNN(nn.Module):
             coors_out = coors
 
         if exists(self.node_mlp):
-            m_i = m_ij.pow(self.p).sum(dim = -2).pow(1/self.p)
+            m_i = (m_ij.relu() + 1e-8).pow(self.p).sum(dim = -2).pow(1/self.p)
 
             normed_feats = self.node_norm(feats)
             node_mlp_input = torch.cat((normed_feats, m_i), dim = -1)
